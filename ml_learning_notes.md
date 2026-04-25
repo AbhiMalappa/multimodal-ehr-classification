@@ -27,6 +27,8 @@
 20. [Prescription Data as Additional Feature Source](#20-prescription-data-as-additional-feature-source)
 21. [Clinical Notes — Real-World Source, Acquisition, and Privacy](#21-clinical-notes--real-world-source-acquisition-and-privacy)
 22. [PHI Screening and HIPAA Compliance Pipeline](#22-phi-screening-and-hipaa-compliance-pipeline)
+23. [ClinicalBERT vs LLMs — Important Distinction](#23-clinicalbert-vs-llms--important-distinction)
+24. [Medical Coding and Billing Audit — ML Use Case](#24-medical-coding-and-billing-audit--ml-use-case)
 22. [PHI Screening and HIPAA Compliance for Clinical Notes](#22-phi-screening-and-hipaa-compliance-for-clinical-notes)
 
 ---
@@ -1173,5 +1175,135 @@ Synthetic notes generated with `[NAME]`, `[DATE]`, `[HOSPITAL]`, `[PHYSICIAN]` p
 For reference, the 18 PHI identifiers that must be removed under HIPAA Safe Harbor:
 
 Names, geographic subdivisions smaller than state, dates (except year) related to an individual, phone numbers, fax numbers, email addresses, SSN, medical record numbers, health plan beneficiary numbers, account numbers, certificate/license numbers, vehicle identifiers, device identifiers, URLs, IP addresses, biometric identifiers (fingerprints, voiceprints), full-face photographs, any other unique identifying number or code.
+
+---
+
+---
+
+## 23. ClinicalBERT vs LLMs — Important Distinction
+
+### What we used — ClinicalBERT (BERT-family encoder)
+
+ClinicalBERT is a BERT-family encoder model, not an LLM in the modern sense. It has approximately 110 million parameters and was designed for text understanding and classification tasks, not text generation.
+
+| | ClinicalBERT (BERT family) | Modern LLM (GPT family) |
+|--|--------------------------|------------------------|
+| Architecture | Encoder only — bidirectional | Decoder — autoregressive |
+| Parameters | ~110 million | Billions |
+| Primary task | Understanding, classification | Text generation |
+| Output | Embedding or class probability | Generated text |
+| Fine-tuning cost | One GPU, hours | Many GPUs, days |
+| "Large"? | Medium by today's standards | Yes |
+| Clinical variant | Bio_ClinicalBERT (MIMIC-III) | None purpose-built |
+
+When people say LLM today they mean large autoregressive generative models — GPT-4, Claude, Llama, Gemini. These generate text token by token. ClinicalBERT does not generate text. It reads a note and produces a number.
+
+### Why ClinicalBERT is the right choice for our task
+
+- Purpose-built for clinical text classification — pre-trained on MIMIC-III clinical notes
+- Feasible fine-tuning on modest hardware — one GPU, a few hours
+- Interpretable output — one probability per patient that SHAP can evaluate
+- Reproducible and open source — no API costs, no rate limits, no vendor dependency
+- Well-established in clinical NLP literature — defensible in a clinical setting
+
+### Where LLMs could be used instead
+
+**Option 1 — LLM as feature extractor via prompting**
+
+Send each note to GPT-4 or similar with a structured prompt asking it to extract specific clinical signals — prior chemotherapy, bone marrow disorder mentioned, hematology consultation, etc. Output is structured JSON that becomes tabular features. No fine-tuning needed. Requires API access and costs money per note. Good when you do not want to fine-tune at all and need quick structured extraction.
+
+**Option 2 — Open-source LLM fine-tuned for classification**
+
+Fine-tune a smaller open-source LLM (Llama 3 8B, Mistral 7B) for binary classification. More powerful than ClinicalBERT but requires significantly more GPU memory and training time. Overkill for a binary classification task on 9,942 notes.
+
+**For our use case ClinicalBERT is correct.** Using GPT-4 for a binary classification task on clinical notes is expensive, harder to explain in a regulated clinical environment, introduces vendor dependency, and provides no meaningful improvement over a purpose-built clinical encoder model.
+
+### The terminology distinction matters when presenting
+
+When presenting this work, be precise. Say "we fine-tuned ClinicalBERT, a BERT-family clinical encoder model" — not "we used an LLM." The distinction signals technical accuracy and avoids overstating the complexity of the approach. Interviewers and clinical stakeholders who know ML will notice the difference.
+
+---
+
+---
+
+## 24. Medical Coding and Billing Audit — ML Use Case
+
+### The business problem
+
+Pancytopenia is frequently miscoded or missed at hospital discharge. Coders working under volume pressure assign partial codes — anemia (D64.9), thrombocytopenia (D69.6), neutropenia (D70.9) — separately instead of the unified pancytopenia code (D61.818), or miss it entirely. Each missed secondary diagnosis can shift the DRG weight and reduce reimbursement by thousands of dollars per case.
+
+This is called undercoding — a systematic revenue leakage problem that exists across most hospital coding departments.
+
+### Where the model sits in the workflow
+
+```
+Patient discharged
+      |
+Coder assigns ICD codes
+      |
+Model scores visit: P(pancytopenia)
+      |
+Audit logic compares score vs coding decision:
+
+  High P + NOT coded  ->  Flag: coding review (revenue recovery)
+  High P + coded      ->  Consistent, no action
+  Low P  + coded      ->  Flag: compliance review (overcoding risk)
+  Low P  + NOT coded  ->  Consistent, no action
+```
+
+The model does not assign codes. It surfaces discrepancies for human review. The coder makes the final determination. This keeps the model in an administrative role — no FDA approval required.
+
+### Why this is a better use case than pure clinical detection
+
+For clinical detection, missing a positive case (false negative) is the primary concern — failing to diagnose a patient is a patient safety issue.
+
+For billing audit, precision is the primary concern — every flagged visit costs coder review time. A low-precision model that flags many false leads costs more in reviewer time than it recovers in revenue.
+
+The same model serves both use cases — just with different threshold priorities. MCC threshold for billing audit (balanced, higher precision). Recall floor threshold for clinical screening (catches more cases, accepts more false alarms).
+
+### The target variable does not change
+
+The label stays: pancytopenia coded (1) vs not coded (0). The ICD codes remain the ground truth. The change is in how the model output is used — not in how it is built.
+
+This is an important design principle: the same prediction model can serve multiple use cases depending on how its output is consumed downstream.
+
+### The key limitation to state clearly
+
+The model is trained on historical ICD codes as ground truth. It cannot detect systematic miscoding — if a certain patient type was consistently miscoded in the training data, the model learned that pattern and will reproduce it. It detects inconsistent coding errors — visits that look like correctly coded pancytopenia cases but were not coded. This covers the majority of revenue leakage in practice.
+
+### ICD audit features — why they matter
+
+Five binary flags derived from secondary ICD codes:
+- has_anemia_code (D64.x)
+- has_thrombocytopenia_code (D69.6)
+- has_neutropenia_code (D70.x)
+- has_chemo_code (Z51.11, Z79.899)
+- has_related_blood_disorder (any D6x/D7x)
+
+These flags capture the partial coding pattern — the most common miscoding error. A coder who assigned all three component codes separately instead of the unified pancytopenia code will show all three flags as positive. The model learns this pattern and uses it to flag similar future cases.
+
+### primary_icd should NOT be a model feature
+
+The primary ICD is assigned by the same coder being audited. Using it as a model input would create circular logic — the model would learn coder behavior rather than the underlying clinical reality. It belongs in the audit output layer for context, not in the model itself.
+
+### Precision-focused threshold analysis
+
+For billing audit, present the threshold analysis as a business decision table:
+
+| Threshold | Precision | Recall | Flagged | Est Net Revenue/wk |
+|-----------|-----------|--------|---------|-------------------|
+| 0.50 | 0.45 | 0.85 | 180 | $8,200 |
+| 0.70 | 0.62 | 0.72 | 95 | $9,100 |
+| 0.92 | 0.70 | 0.64 | 47 | $7,800 |
+
+Net revenue = (flags x precision x avg_recovery) - (flags x review_cost)
+
+The audit team selects the threshold based on coder capacity and acceptable review cost — a business decision, not a model decision. The model provides the options.
+
+### DRG — why it matters for prioritization
+
+DRG (Diagnosis Related Group) determines hospital reimbursement. When a secondary diagnosis like pancytopenia is added, the DRG weight can shift — sometimes by thousands of dollars per case. Knowing the DRG weight of each visit allows the audit worklist to be ranked by expected revenue impact — highest impact cases reviewed first.
+
+DRG weight is not a model feature (does not predict clinical presence) but is an audit prioritization feature (determines which flagged visits to tackle first).
 
 ---
